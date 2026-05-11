@@ -1,0 +1,30 @@
+# Build outputs
+Build/
+DerivedData/
+tmp/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# ggml CMake build trees (rebuilt via scripts/build_ggml.sh)
+vendors/llama.cpp/build-cpu/
+vendors/llama.cpp/build-metal/
+vendors/llama.cpp/build-ios/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+.clangd/
+.cache/
+
+# Generated audio (bench outputs)
+*.wav
