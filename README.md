@@ -5,6 +5,9 @@ different inference backends — MLX, Core ML, and ggml/llama.cpp — so we
 can compare quality, latency, memory, and engineering complexity head to
 head on the same hardware.
 
+<img width="900" height="692" alt="Screenshot 2026-05-10 at 11 59 32 PM" src="https://github.com/user-attachments/assets/d810cc13-2d6e-43b4-98a2-bd042a1bc4a5" />
+
+
 The original [KittenTTS] is a tiny (~25 M parameter) text-to-speech
 model from [KittenML]; the published reference implementation runs on
 ONNX Runtime, and [KittenTTS-swift] is the official Swift port that
