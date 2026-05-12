@@ -28,3 +28,22 @@ venv/
 
 # Generated audio (bench outputs)
 *.wav
+
+# AI agent tooling (local only — not committed to this repo)
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.agents/
+.claude/
+.gemini/
+.agentignore
+.claudeignore
+.geminiignore
+.cursorignore
+.aiderignore
+.claude-template-applied
+.claude/settings.local.json
+.gemini/settings.local.json
+.agents/settings.local.json
+cpu/build/
+tmp/cpu_build/

@@ -93,6 +93,10 @@ enum KittenBench {
                                 backend: .ggml,
                                 variant: nil,
                                 compute: nil))
+        allConfigs.append(.init(label:   "cpu",
+                                backend: .cpu,
+                                variant: nil,
+                                compute: nil))
         let configs: [BenchConfig]
         if let want = wanted {
             configs = allConfigs.filter { c in
@@ -135,6 +139,7 @@ enum KittenBench {
         let ml = KittenTTSCoreML()
 #if os(macOS) || os(iOS)
         let ggml = KittenTTSLlamaCpp()
+        let cpuB = KittenTTSCpu()
 #endif
         for r in 0..<runs {
             let t0 = Date()
@@ -165,6 +170,14 @@ enum KittenBench {
                     samples = try await ggml.speak(
                         text: text,
                         config: KittenTTSLlamaCpp.Config(
+                            speed: 1.0, voiceID: voice),
+                        callback: { _, _ in
+                            if firstByte == nil { firstByte = Date() }
+                        })
+                case .cpu:
+                    samples = try await cpuB.speak(
+                        text: text,
+                        config: KittenTTSCpu.Config(
                             speed: 1.0, voiceID: voice),
                         callback: { _, _ in
                             if firstByte == nil { firstByte = Date() }

@@ -127,6 +127,7 @@ enum Backend: String, CaseIterable, Identifiable {
     case coreml = "CoreML"
 #if os(macOS) || os(iOS)
     case ggml = "GGML"
+    case cpu  = "💬🐈"
 #endif
     var id: String { rawValue }
 
@@ -142,6 +143,7 @@ enum Backend: String, CaseIterable, Identifiable {
         case .coreml: label = ""       // unused — CoreML uses picker
 #if os(macOS) || os(iOS)
         case .ggml:   label = "fp32"   // kitten_full.gguf is fp32
+        case .cpu:    label = "fp32"   // kt_tensor is fp32-only in v1
 #endif
         }
         return label
@@ -153,6 +155,7 @@ enum Backend: String, CaseIterable, Identifiable {
         case .coreml: label = ""       // unused
 #if os(macOS) || os(iOS)
         case .ggml:   label = "CPU"    // CPU-only by design
+        case .cpu:    label = "CPU"    // CPU-only (cblas)
 #endif
         }
         return label
@@ -317,6 +320,12 @@ enum SamplePrompts {
 }
 
 struct KittenTTSView: View {
+    /// Scene phase — used to clear `lastBackendAttempt` on graceful
+    /// app exit (Cmd-Q on macOS, swipe-up / lock on iOS). Without
+    /// this, any normal quit during an in-flight speak() leaves the
+    /// sentinel set and the next launch mis-reports it as a crash.
+    @Environment(\.scenePhase) private var scenePhase
+
     // Default prompt on first launch — the Long Paragraph exercises
     // the chunker and stresses all L / N buckets so the user hears
     // the full quality envelope without having to pick anything.
@@ -334,12 +343,18 @@ struct KittenTTSView: View {
     // Voice + backend + variant + compute persist; speed is
     // session-only.
     @AppStorage("voice")   private var voice: String = "Kiki"
-    // GGML has the cheapest cold-start (~250 ms preload — the C side
-    // mmap's the GGUF and skips the Core ML / MLX graph-compile
-    // step), so it's the friendliest default on first launch.
-    // Existing installs keep whatever they had via @AppStorage; only
-    // fresh user defaults see this fall through.
-    @AppStorage("backend") private var backend: Backend = .ggml
+    // Raw (pure-C / cblas) is the default: same low cold-start as GGML
+    // (mmap'd GGUF, no graph compile) and after the mmap-backed arena
+    // fix it sits at ~80 MB resident — the lightest-footprint option
+    // we have. Existing installs keep whatever they had via
+    // @AppStorage; only fresh user defaults (and users whose persisted
+    // "C/BLAS" rawValue no longer parses after the rename to "Raw")
+    // see this fall through.
+    // @AppStorage key is "backend_v2" so existing installs with a
+    // stale "GGML" stored under "backend" fall through to the new
+    // default below. The old "backend" key remains in UserDefaults
+    // (harmless garbage that the OS will reap eventually).
+    @AppStorage("backend_v2") private var backend: Backend = .cpu
     // Default to int8w — only weights are quantized to 8-bit,
     // activations stay in fp16, so it runs cleanly on both ANE and
     // CPU. Bundled variants: int8w (~26 MB) and fp32 (~96 MB) — the
@@ -365,36 +380,16 @@ struct KittenTTSView: View {
     /// already true at that point so the spinner overlay would
     /// otherwise disappear during the multi-second compile.
     @State private var firstChunkArrived: Bool = false
-    /// Backends that have hit a catastrophic failure on this device.
-    /// Persisted across launches because the worst failure mode (MLX
-    /// hitting a C++ SEGV inside mlx::core::allocator on memory-
-    /// constrained iPhones) is a hard crash, not a Swift throw — so
-    /// the in-session catch path can't see it. Combined with the
-    /// `lastBackendAttempt` sentinel below, a crash gets detected on
-    /// the next launch and the offending backend stays hidden.
-    /// Stored as a comma-separated rawValue list because @AppStorage
-    /// can't hold Set<Enum> directly.
-    @AppStorage("failedBackends") private var failedBackendsRaw:
-        String = ""
     /// Set to the backend's rawValue right before each speak() call
     /// and cleared on success or normal-throw catch. If the app
-    /// launches and finds this non-empty, the previous run crashed
-    /// inside that backend; we add it to `failedBackends` and clear.
+    /// launches and finds this non-empty, the previous run died
+    /// inside that backend (SEGV, jetsam, or a debugger kill); the
+    /// .task crash post-mortem notifies the user and switches to the
+    /// safe default. We DON'T disable the offending backend - that
+    /// made debugging painful (every test-kill effectively bricked
+    /// the picker) — the user can re-pick it immediately.
     @AppStorage("lastBackendAttempt") private var
         lastBackendAttempt: String = ""
-
-    private var failedBackends: Set<Backend> {
-        Set(failedBackendsRaw
-                .split(separator: ",")
-                .compactMap { s in Backend(rawValue: String(s)) })
-    }
-    private func markBackendFailed(_ b: Backend) {
-        var s = failedBackends
-        s.insert(b)
-        failedBackendsRaw = s.map(\.rawValue)
-                             .sorted()
-                             .joined(separator: ",")
-    }
     /// Non-nil = an alert is being shown explaining a backend
     /// fallback. Cleared when the user dismisses it.
     @State private var alertMessage: String? = nil
@@ -429,6 +424,7 @@ struct KittenTTSView: View {
     private let coreMLTTS = KittenTTSCoreML()
 #if os(macOS) || os(iOS)
     private let ggmlTTS = KittenTTSLlamaCpp()
+    private let cpuTTS  = KittenTTSCpu()
 #endif
     private let player = AudioPlayer()
 
@@ -516,9 +512,7 @@ struct KittenTTSView: View {
                                        .foregroundColor(.secondary)
                         Spacer()
                         Picker("", selection: $backend) {
-                            ForEach(Backend.allCases.filter { b in
-                                !failedBackends.contains(b)
-                            }) { b in
+                            ForEach(Backend.allCases) { b in
                                 Text(b.rawValue).tag(b)
                             }
                         }
@@ -747,39 +741,45 @@ struct KittenTTSView: View {
                 }
             },
             message: { Text(alertMessage ?? "") })
+        .onChange(of: scenePhase) { _, newPhase in
+            // A normal app exit (Cmd-Q on macOS, swipe-up or lock
+            // on iOS) transitions the scene from .active to
+            // .inactive (and then .background). Clear the in-flight
+            // crash sentinel as we leave .active so the next launch
+            // doesn't mistake the graceful quit for a crash.
+            // A real hard crash skips all of this and the sentinel
+            // stays set, which is what the post-mortem in .task
+            // looks for.
+            if newPhase != .active {
+                lastBackendAttempt = ""
+            }
+        }
         .task {
             // Crash post-mortem: if the previous run wrote a
             // sentinel before calling speak() and never cleared it,
-            // that run crashed (SEGV, jetsam, force-quit) inside
-            // that backend. Add it to the persisted failed set,
-            // clear the sentinel, push the picker to GGML if needed,
-            // and pop an alert so the user knows why this backend
-            // disappeared.
+            // that run died inside that backend (SEGV, jetsam, or
+            // the user killing the debugger). Don't disable the
+            // backend - that's painful during development - just
+            // notify and switch to the safe default (.cpu) so the
+            // next attempt doesn't immediately re-crash. The user
+            // can pick any backend again right away.
             if !lastBackendAttempt.isEmpty,
                let crashed = Backend(
                        rawValue: lastBackendAttempt) {
-                if crashed != .ggml {
-                    markBackendFailed(crashed)
-                    if backend == crashed { backend = .ggml }
-                    log.warn(
-                        "\(crashed.rawValue) crashed last run — " +
-                        "hidden, switched to GGML")
-                    alertMessage =
-                        "\(crashed.rawValue) crashed on this " +
-                        "device during the previous run.\n\n" +
-                        "Likely cause: the model is too memory-" +
-                        "heavy for this device, or the Metal " +
-                        "compiler service was jetsammed under " +
-                        "pressure. \(crashed.rawValue) is a hard " +
-                        "C++ crash that Swift can't catch in " +
-                        "flight, so the only safe response is to " +
-                        "hide it.\n\n" +
-                        "It has been removed from the Backend " +
-                        "picker for this install. GGML is " +
-                        "selected as the fallback. To re-enable " +
-                        "\(crashed.rawValue), delete the app and " +
-                        "reinstall, or reset its data in Settings."
+                if backend == crashed && crashed != .cpu {
+                    backend = .cpu
                 }
+                log.warn(
+                    "\(crashed.rawValue) didn't finish cleanly " +
+                    "last run — switched to \(Backend.cpu.rawValue)")
+                alertMessage =
+                    "\(crashed.rawValue) didn't finish cleanly " +
+                    "last run.\n\n" +
+                    "Likely causes: out-of-memory (jetsam), a C++ " +
+                    "SEGV that Swift can't catch in flight, or you " +
+                    "killed the debugger. Switching to " +
+                    "\(Backend.cpu.rawValue) for this session — " +
+                    "pick another backend any time."
                 lastBackendAttempt = ""
             }
             // @State `text` is initialized before @AppStorage reads
@@ -915,6 +915,20 @@ struct KittenTTSView: View {
                     audioS, rtf))
             }
         }
+        cpuTTS.onChunkMetrics = { [weak log] m in
+            let audioS = Double(m.samples) / 24000.0
+            let rtf = audioS / (m.totalMs / 1000.0)
+            Task { @MainActor in
+                log?.recordChunkAudio(audioS)
+                log?.metric(String(
+                    format:
+                        "💬🐈   chunk   phonemes=%d frames=%d" +
+                        "         total %.0fms  audio %.2fs  " +
+                        "RTF %.1fx",
+                    m.phonemes, m.frames, m.totalMs,
+                    audioS, rtf))
+            }
+        }
 #endif
         // Only the currently-selected backend is resident at any
         // time.
@@ -966,6 +980,7 @@ struct KittenTTSView: View {
         case .coreml: tag = "CoreML".paddedRight(6)
 #if os(macOS) || os(iOS)
         case .ggml:   tag = "GGML".paddedRight(6)
+        case .cpu:    tag = "💬🐈".paddedRight(6)
 #endif
         }
         return tag
@@ -981,6 +996,7 @@ struct KittenTTSView: View {
             case .coreml: try await coreMLTTS.preload()
 #if os(macOS) || os(iOS)
             case .ggml:   try await ggmlTTS.preload()
+            case .cpu:    try await cpuTTS.preload()
 #endif
             }
             let ms = Date().timeIntervalSince(t0) * 1000
@@ -1004,6 +1020,7 @@ struct KittenTTSView: View {
         case .coreml: coreMLTTS.unload()
 #if os(macOS) || os(iOS)
         case .ggml:   ggmlTTS.unload()
+        case .cpu:    cpuTTS.unload()
 #endif
         }
         // Give autorelease pools a moment to actually drop the
@@ -1155,6 +1172,12 @@ struct KittenTTSView: View {
                     let s = try await ggmlTTS.speak(
                         text: text, config: cfg, callback: cb)
                     totalSamples = s.count
+                case .cpu:
+                    let cfg = KittenTTSCpu.Config(
+                        speed: capturedSpeed, voiceID: voice)
+                    let s = try await cpuTTS.speak(
+                        text: text, config: cfg, callback: cb)
+                    totalSamples = s.count
 #endif
                 }
                 if !Task.isCancelled {
@@ -1240,19 +1263,20 @@ struct KittenTTSView: View {
                             // MLX / CoreML failed in a recoverable
                             // way (Metal compiler jetsam surfaced
                             // via MLX.withError, ANE alignment
-                            // hang, etc.). Persist the failure so
-                            // the picker keeps the backend hidden
-                            // across launches, switch to GGML, and
-                            // surface the message in an alert.
-                            self.markBackendFailed(failedBackend)
+                            // hang, etc.). Notify and fall back to
+                            // the safe default. The backend stays
+                            // in the picker — the user can re-pick
+                            // it after fixing the root cause (e.g.
+                            // freeing memory, restarting Metal).
                             self.alertMessage =
                                 "\(failedBackend.rawValue) " +
                                 "failed on this device:\n\n" +
                                 "\(error.localizedDescription)" +
-                                "\n\n" +
-                                "Falling back to GGML."
-                            self.backend = .ggml
-                            self.status = "Switched to GGML"
+                                "\n\nFalling back to " +
+                                "\(Backend.cpu.rawValue)."
+                            self.backend = .cpu
+                            self.status =
+                                "Switched to \(Backend.cpu.rawValue)"
                         }
                     }
                     // wasCancelled: User clicked Stop (or a backend

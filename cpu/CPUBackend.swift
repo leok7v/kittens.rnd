@@ -1,6 +1,10 @@
-// v1 is macOS-only — the linked llama.cpp static libs in
-// vendors/llama.cpp/build-cpu/ are built for macOS. iOS/xrOS support
-// would require building those libs for each platform via xcframework.
+// CPUBackend.swift -- Swift wrapper around the pure-C / cblas kt_cpu
+// backend. Cloned from ggml/GGMLBackend.swift; the only differences
+// are the C symbol prefix (kt_ -> kt_cpu_), the class name, and the
+// fixed-variant / compute labels reported to the UI.
+//
+// v1 is macOS + iOS. The C side is portable (cblas + libm); the only
+// platform shim is in cpu/kt_tensor.c.
 #if os(macOS) || os(iOS)
 
 import Foundation
@@ -8,23 +12,22 @@ import os
 // MLX is shared with the other backends for voices.safetensors loading.
 import MLX
 
-/// ggml/llama.cpp-backed alternative to `KittenTTS` and
-/// `KittenTTSCoreML`. Same public `speak` API so KittenApp can A/B all
-/// three backends.
+/// kt_tensor / Accelerate-backed alternative to KittenTTS and
+/// KittenTTSCoreML. Same public `speak` API so KittensRnDApp can A/B
+/// all four backends.
 ///
-/// Implementation lives in `KittensGGML/kittens-tts.c` (see
-/// KittensGGML.h for the C API). The bridging header exposes the C
-/// symbols (`kt_create`, `kt_synthesize`, …) directly to Swift.
+/// Implementation lives in `cpu/kittens-tts-cpu.c` (see KittensCPU.h
+/// for the C API). The bridging header exposes the C symbols
+/// (`kt_cpu_create`, `kt_cpu_synthesize`, ...) directly to Swift.
 ///
 /// v1 caveats:
-/// - CPU only. `Compute.metal` requires a custom Metal shader for
-///   atan2 in the noise path; not yet wired up.
-/// - One graph rebuilt per `kt_synthesize` call. Average speech-rate
-///   latency on M-series is ~0.1× realtime per chunk after the first
-///   call.
-/// - Phonemizer is the shared CEPhonemizer C++ engine — same as the
-///   other backends, so input phonemes match.
-public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
+/// - CPU only.
+/// - One inference per `kt_cpu_synthesize` call. Single-threaded per
+///   ctx (matches the C API).
+/// - kt_cpu_synthesize is currently a stub returning silence — the
+///   four stages need porting from kittens-tts.c. See
+///   cpu/kittens-tts-cpu.c for the TODO list.
+public final nonisolated class KittenTTSCpu: @unchecked Sendable {
 
     public nonisolated struct Config: Sendable {
         public var speed:   Float
@@ -35,8 +38,6 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
         }
     }
 
-    /// Single backend variant for v1 (CPU only). Kept as an enum so
-    /// the UI can present a consistent control across backends.
     public enum Compute: String, Sendable, CaseIterable {
         case cpu = "CPU"
     }
@@ -54,18 +55,13 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
 
     public var onChunkMetrics: ((ChunkMetrics) -> Void)?
 
-    // 24000 Hz / 80 Hz × 2 (matches CoreML backend).
+    // 24000 Hz / 80 Hz × 2 (matches GGML backend).
     static let audioPerFrame: Int = 600
 
-    private var ctx: OpaquePointer?                  // kt_ctx *
+    private var ctx: OpaquePointer?                  // kt_cpu_ctx *
     private var voiceEmbeds: [String: [Float]] = [:] // flat 400*256
     private let loadLock = OSAllocatedUnfairLock()
-    /// Serialises kt_synthesize calls. The C API is single-threaded
-    /// per ctx (see KittensGGML.h). The depth-1 prefetch in `speak`
-    /// spawns chunk N+1's task while chunk N is still inferring —
-    /// without this lock the two would race on shared ggml backend
-    /// buffers (manifests as EXC_BAD_ACCESS / objc_msgSend corruption
-    /// on iOS).
+    /// Serialises synthesize calls — single-threaded per ctx by design.
     private let inferLock = NSLock()
 
     public static var voiceAliases: [String: String] {
@@ -80,7 +76,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
     }
 
     deinit {
-        if let c = ctx { kt_destroy(c) }
+        if let c = ctx { kt_cpu_destroy(c) }
     }
 
     public func preload() async throws {
@@ -91,7 +87,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                     modelDir = d
                 } else {
                     throw NSError(
-                        domain: "KittenTTSLlamaCpp",
+                        domain: "KittenTTSCpu",
                         code: 1,
                         userInfo: [NSLocalizedDescriptionKey:
                             "no bundled model dir"])
@@ -101,23 +97,20 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                 if !FileManager.default.fileExists(
                         atPath: ggufURL.path) {
                     throw NSError(
-                        domain: "KittenTTSLlamaCpp",
+                        domain: "KittenTTSCpu",
                         code: 2,
                         userInfo: [NSLocalizedDescriptionKey:
                             "kitten_full.gguf not found at " +
                             "\(ggufURL.path)"])
                 }
-                let cgguf    = ggufURL.path.cString(using: .utf8)!
-                let cbackend = "cpu".cString(using: .utf8)!
-                // kt_create returns OpaquePointer? in Swift (kt_ctx
-                // is a forward-declared C struct); assign directly.
-                ctx = kt_create(cgguf, cbackend)
+                let cgguf = ggufURL.path.cString(using: .utf8)!
+                ctx = kt_cpu_create(cgguf)
                 if ctx == nil {
                     throw NSError(
-                        domain: "KittenTTSLlamaCpp",
+                        domain: "KittenTTSCpu",
                         code: 3,
                         userInfo: [NSLocalizedDescriptionKey:
-                            "kt_create failed"])
+                            "kt_cpu_create failed"])
                 }
             }
             if voiceEmbeds.isEmpty {
@@ -128,7 +121,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
 
     public func unload() {
         loadLock.withLock {
-            if let c = ctx { kt_destroy(c); ctx = nil }
+            if let c = ctx { kt_cpu_destroy(c); ctx = nil }
             voiceEmbeds.removeAll()
         }
     }
@@ -140,7 +133,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
         callback: SpeakCallback? = nil
     ) async throws -> [Float] {
         try await preload()
-        let voiceID = KittenTTSLlamaCpp.voiceAliases[config.voiceID]
+        let voiceID = KittenTTSCpu.voiceAliases[config.voiceID]
                           ?? config.voiceID
         let voiceRows: [Float]
         if let v = voiceEmbeds[voiceID]
@@ -148,7 +141,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
             voiceRows = v
         } else {
             throw NSError(
-                domain: "KittenTTSLlamaCpp",
+                domain: "KittenTTSCpu",
                 code: 4,
                 userInfo: [NSLocalizedDescriptionKey:
                     "voice '\(voiceID)' not found"])
@@ -156,38 +149,18 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
         let effectiveSpeed = config.speed
                            * (KittenTTS.speedPriors[voiceID] ?? 1.0)
         let normalised = TextPreprocessor.process(text)
-        // GGML allocates buffers dynamically — no L=400 bucket like
-        // CoreML. Pass `.max` so the chunker only breaks on `.!?` and
-        // never on commas; whole sentences stay together regardless
-        // of length. Eliminates the mid-sentence comma-split pause.
-        // Paragraph-aware chunking with em-dash breaks. See
-        // CPUBackend / TextChunker.phonemizedChunks for the rationale
-        // around silence durations (0/60/120 ms).
+        // kt_cpu allocates buffers dynamically — no L=400 bucket like
+        // CoreML. Whole sentences stay as a single chunk regardless of
+        // length (chunker only breaks on .!?).
+        // Paragraph-aware chunking with em-dash breaks: speaker turns
+        // stay in one chunk for prosody continuity, narrator/dialog
+        // interleaves ("That's right, — nodded the Halfling, — But
+        // please call them hobbits.") split at " — " so each
+        // sub-piece gets its own brief beat. priorSilenceMs encodes
+        // the silence to emit before each chunk (0/60/120 ms).
         let chunks = TextChunker.phonemizedChunks(normalised)
         var allAudio: [Float] = []
         if !chunks.isEmpty {
-            // Depth-1 prefetch:
-            //
-            //   sequential: [phonemize_N][synthesize_N][cb_N]
-            //               [phonemize_{N+1}]...
-            //   prefetched: [phonemize_N][synthesize_N+cb_N +
-            //               phonemize_{N+1}+spawn_{N+1}]...
-            //
-            // Phonemize and the cb dispatch run on the foreground
-            // task's thread; synthesize runs on a detached background
-            // task. We spawn task_{N+1} BEFORE awaiting task_N, so by
-            // the time we emit chunk N, chunk N+1's synthesize is
-            // already underway. Phonemize_{N+1} and the cb for N
-            // overlap with synthesize_{N+1} starting up.
-            //
-            // NOTE: kt_synthesize is single-threaded per ctx, so two
-            // concurrent synthesizes on the same ctx would race. Tasks
-            // are scheduled with a serialised infer queue so they run
-            // in order; the depth-1 lookahead doesn't add inference
-            // parallelism, just hides phonemize + cb cost. For real
-            // parallelism (RTF ≈ 1 hardware), we'd need a second ctx —
-            // costs an extra 35 MB of model weights but lets two
-            // synthesizes run simultaneously.
             let speed = effectiveSpeed
             let speakSelf = self
             func taskFor(_ idx: Int) -> Task<[Float], Error> {
@@ -204,8 +177,18 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                 }
             }
             var pendingTask: Task<[Float], Error>? = taskFor(0)
+            // Ensure any prefetched-but-unconsumed task gets cancelled
+            // if we exit the loop (Stop pressed, error thrown, etc.) —
+            // synthesizeChunk checks Task.isCancelled and skips the C
+            // call instead of running it for output the caller has
+            // already abandoned.
             defer { pendingTask?.cancel() }
             for idx in chunks.indices {
+                // Top-of-iteration cancellation gate: when speakTask
+                // was cancelled (Stop, backend switch) we still
+                // have to drain the in-flight detached task by
+                // awaiting it, but we MUST NOT start another chunk
+                // or process its audio.
                 if Task.isCancelled {
                     pendingTask?.cancel()
                     break
@@ -218,11 +201,16 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                     do {
                         audio = try await task.value
                     } catch is CancellationError {
+                        // The prefetched task we just awaited was
+                        // already cancelled — nothing to emit.
                         break
                     }
                     if Task.isCancelled { break }
-                    // Silences scale inversely with speed (see
-                    // CPUBackend comment for rationale).
+                    // Silences scale inversely with effectiveSpeed —
+                    // at speed=1.5 the spoken audio is 1/1.5x the
+                    // duration, so a fixed 180 ms paragraph beat
+                    // sounds disproportionately long. Divide by
+                    // speed to keep the *perceived* pause consistent.
                     let silenceN = Int(
                         Double(chunks[idx].priorSilenceMs) * 24.0
                         / Double(speed))
@@ -232,13 +220,17 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                           + audio
                     if let cb = callback {
                         let int16 = emit.map { f -> Int16 in
-                            // NaN/Inf guard before Int(.rounded())
-                            // which traps on non-finite floats. ggml
-                            // shouldn't produce them but the guard
-                            // mirrors the MLX/CoreML paths for parity.
-                            let safe: Float = f.isFinite ? f : 0
+                            // Clamp to [-1, 1] BEFORE scaling so the
+                            // intermediate Int can't overflow when the
+                            // C side produces a stray huge value (e.g.
+                            // mag = exp(big) blowing up iSTFT).
+                            let clamped: Float
+                            if !f.isFinite { clamped = 0 }
+                            else if f >  1 { clamped =  1 }
+                            else if f < -1 { clamped = -1 }
+                            else            { clamped = f }
                             return Int16(clamping:
-                                Int((safe * 32767.0).rounded()))
+                                Int((clamped * 32767.0).rounded()))
                         }
                         int16.withUnsafeBufferPointer { buf in
                             if let base = buf.baseAddress {
@@ -261,7 +253,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
             c = cur
         } else {
             throw NSError(
-                domain: "KittenTTSLlamaCpp",
+                domain: "KittenTTSCpu",
                 code: 5,
                 userInfo: [NSLocalizedDescriptionKey:
                     "context not initialised"])
@@ -270,26 +262,30 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                      "style256 must be 256 floats")
         let ids32: [Int32] = phonemes.map { p in Int32(p) }
         let t0 = Date()
-        // Cancellation gates: skip the C synth call if the task was
-        // cancelled before / while waiting for the inferLock.
+        // Early-exit if this Task was cancelled before we even
+        // started — saves a full synthesize round on prefetched
+        // chunks that the caller has since abandoned (Stop pressed,
+        // backend switched, etc.). The C call kt_cpu_synthesize is
+        // not itself interruptible, so once it starts it runs to
+        // completion; the most we can do is skip it.
         if Task.isCancelled { throw CancellationError() }
         inferLock.lock()
         if Task.isCancelled {
             inferLock.unlock()
             throw CancellationError()
         }
-        let audio: kt_audio = ids32.withUnsafeBufferPointer { idsBuf in
+        let audio: kt_cpu_audio = ids32.withUnsafeBufferPointer { idsBuf in
             style.withUnsafeBufferPointer { styBuf in
-                kt_synthesize(c,
-                              idsBuf.baseAddress, Int32(idsBuf.count),
-                              styBuf.baseAddress, speed)
+                kt_cpu_synthesize(c,
+                                  idsBuf.baseAddress, Int32(idsBuf.count),
+                                  styBuf.baseAddress, speed)
             }
         }
         inferLock.unlock()
         let elapsedMs = Date().timeIntervalSince(t0) * 1000.0
         let out: [Float]
         if let samples = audio.samples, audio.n_samples > 0 {
-            defer { kt_audio_free(audio) }
+            defer { kt_cpu_audio_free(audio) }
             let n = Int(audio.n_samples)
             let buf = UnsafeBufferPointer(start: samples, count: n)
             out = Array(buf)
@@ -301,10 +297,10 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
                 samples:  n))
         } else {
             throw NSError(
-                domain: "KittenTTSLlamaCpp",
+                domain: "KittenTTSCpu",
                 code: 6,
                 userInfo: [NSLocalizedDescriptionKey:
-                    "kt_synthesize failed"])
+                    "kt_cpu_synthesize failed"])
         }
         return out
     }
@@ -315,7 +311,7 @@ public final nonisolated class KittenTTSLlamaCpp: @unchecked Sendable {
             modelDir = d
         } else {
             throw NSError(
-                domain: "KittenTTSLlamaCpp",
+                domain: "KittenTTSCpu",
                 code: 7,
                 userInfo: [NSLocalizedDescriptionKey:
                     "no bundled model dir"])

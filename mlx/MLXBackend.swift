@@ -180,27 +180,18 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
                 // `.!?` and never on commas; whole sentences stay
                 // together regardless of length. Eliminates the
                 // mid-sentence comma-split pause.
-                let chunks = TextChunker.chunk(normalised,
-                                               maxLen: .max)
-                // 120 ms inter-sentence silence — only between true
-                // sentence breaks (prev chunk ends in `.!?`).
-                // Sub-clause boundaries (`,;:` left mid-sentence by
-                // the maxLen overflow split, or a soft-comma
-                // terminator) get no gap so the listener doesn't
-                // hear an unexpected pause inside one thought.
-                let gap = [Float](repeating: 0,
-                                  count: Int(0.12 * 24000))
-                func gapAfter(_ prev: String) -> [Float] {
-                    var g: [Float] = []
-                    if let last = prev.last,
-                       last == "." || last == "!" || last == "?" {
-                        g = gap
-                    }
-                    return g
-                }
+                // Paragraph-aware chunking with em-dash breaks. See
+                // CPUBackend / TextChunker.phonemizedChunks for
+                // rationale.
+                let chunks =
+                    TextChunker.phonemizedChunks(normalised)
                 var allAudio: [Float] = []
-                for (idx, chunk) in chunks.enumerated() {
-                    let phonemes = try Phonemizer.phonemize(chunk)
+                for (_, c) in chunks.enumerated() {
+                    // Stop / backend-switch cancels this Task —
+                    // skip remaining chunks.
+                    if Task.isCancelled { break }
+                    let chunk = c.text
+                    let phonemes = c.phonemes
                     let inputIds = MLXArray(
                         phonemes.map { p in Int32(p) })
                             .reshaped([1, -1])
@@ -215,15 +206,22 @@ public final nonisolated class KittenTTS: @unchecked Sendable {
                         style256: style,
                         speed:    effectiveSpeed)
                     let samples: [Float] = audio.asArray(Float.self)
+                    if Task.isCancelled { break }
                     let elapsedMs = Date().timeIntervalSince(tStart)
                                         * 1000.0
                     onChunkMetrics?(ChunkMetrics(
                         phonemes:  phonemes.count,
                         elapsedMs: elapsedMs,
                         samples:   samples.count))
-                    let emit: [Float] = idx == 0
+                    // Silences scale inversely with effectiveSpeed
+                    // (see CPUBackend comment for rationale).
+                    let silenceN = Int(
+                        Double(c.priorSilenceMs) * 24.0
+                        / Double(effectiveSpeed))
+                    let emit: [Float] = silenceN <= 0
                         ? samples
-                        : gapAfter(chunks[idx - 1]) + samples
+                        : [Float](repeating: 0, count: silenceN)
+                          + samples
                     if let cb = callback {
                         let int16Samples = emit.map { f -> Int16 in
                             // NaN/Inf guard before Int(...) which

@@ -231,9 +231,26 @@ enum TextPreprocessor {
     }
 
     private static func normaliseWhitespace(_ text: String) -> String {
-        text.replacingOccurrences(of: #"\s+"#, with: " ",
-                                  options: .regularExpression)
-            .trimmingCharacters(in: .whitespaces)
+        // Preserve newlines through preprocessing so downstream
+        // chunking can see paragraph structure. Earlier this collapsed
+        // every whitespace run (including \n\n) to a single space,
+        // which made TextChunker fall back to sentence-only splitting
+        // and broke dialog/story prosody.
+        // Pipeline:
+        //   1) horizontal whitespace (spaces, tabs) -> single space
+        //   2) line-leading whitespace stripped (so "  • foo" -> "• foo")
+        //   3) 3+ consecutive newlines collapsed to \n\n
+        //   4) trim outer whitespace
+        var t = text.replacingOccurrences(
+            of: #"[ \t]+"#, with: " ",
+            options: .regularExpression)
+        t = t.replacingOccurrences(
+            of: #"(?m)^[ \t]+"#, with: "",
+            options: .regularExpression)
+        t = t.replacingOccurrences(
+            of: #"\n{3,}"#, with: "\n\n",
+            options: .regularExpression)
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func numberToWords(_ n: Int) -> String {
@@ -353,18 +370,161 @@ struct TextChunker {
     /// audible pause inside the sentence even with the inter-chunk
     /// gap suppressed.
     static func chunk(_ text: String, maxLen: Int = 280) -> [String] {
-        var chunks: [String] = []
-        for paragraph in text.components(separatedBy: "\n\n") {
-            let para = paragraph.trimmingCharacters(
-                in: .whitespacesAndNewlines)
-            if !para.isEmpty {
-                let normalized = para.replacingOccurrences(
-                    of: "\n", with: " ")
-                chunks.append(contentsOf:
-                    splitSentences(normalized, maxLen: maxLen))
+        return phonemizedChunks(text).map { c in c.text }
+    }
+
+    /// A chunk plus the phonemes it produces, plus the silence to
+    /// emit BEFORE this chunk (encoded as ms). Returned by
+    /// `phonemizedChunks` — pre-phonemized so the backend skips a
+    /// redundant phonemize call, and silences are computed centrally
+    /// so all four backends agree on dialog timing.
+    ///
+    /// Typical priorSilenceMs values:
+    ///   0   -> first chunk in stream / mid-paragraph sub-split
+    ///   60  -> em-dash break (narrator/dialog interleave inside one
+    ///          speaker turn): brief pause without resetting the arc
+    ///   120 -> paragraph / speaker-turn break: a real beat
+    struct PhonemizedChunk {
+        public let text: String
+        public let phonemes: [Int]
+        public let priorSilenceMs: Int
+    }
+
+    /// Back-compat wrapper for callers that just want the text list.
+    static func chunkParagraphs(_ text: String,
+                                maxLen: Int = 280) -> [String] {
+        return phonemizedChunks(text).map { c in c.text }
+    }
+
+    /// Inter-chunk silences. Tunable in one place. Order of magnitude:
+    /// the model already emits a natural sentence-final fall after
+    /// `. ! ?`, so the BREAK silences are layered ON TOP of that — a
+    /// little goes a long way.
+    public static let paragraphSilenceMs = 180   // between speaker turns
+    public static let sentenceSilenceMs  = 80    // between sentences inside a turn
+    public static let emDashSilenceMs    = 30    // narrator aside inside a turn
+
+    /// Phoneme-aware paragraph chunker with em-dash narrator handling.
+    ///
+    /// Pipeline per paragraph (`\n\n` or bullet-marker delimited):
+    ///   1. Strip the leading bullet glyph (• - — –) so the phonemizer
+    ///      doesn't have to deal with it.
+    ///   2. Split on " — " — in dialog these separate speech from a
+    ///      narrator aside ("That's right, — nodded the Halfling,
+    ///      — But please call them hobbits."). Each piece becomes its
+    ///      own chunk with a short (60 ms) inter-piece silence so the
+    ///      listener hears the beat between "what was said" and
+    ///      "what the narrator described".
+    ///   3. Phonemize each piece. If the result fits in
+    ///      `maxPhonemes`, emit as-is. Otherwise fall back to per-
+    ///      sentence chunks (priorSilenceMs=0 for the sub-splits so
+    ///      the long-thought sentences run back-to-back).
+    ///
+    /// `maxPhonemes` defaults to 480: a conservative ceiling under
+    /// the model's max_pos=512. Heavy punctuation can balloon
+    /// phonemize ratios to ~3-4x char count, so char-based limits
+    /// alone won't catch the overflow.
+    static func phonemizedChunks(_ text: String,
+                                 maxPhonemes: Int = 480)
+                                 -> [PhonemizedChunk] {
+        var out: [PhonemizedChunk] = []
+        var emittedAny = false
+        for paragraph in splitIntoParagraphs(text) {
+            let stripped = stripBulletMarker(
+                paragraph
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .trimmingCharacters(in: .whitespaces))
+            if stripped.isEmpty { continue }
+            // Three-level split: paragraph -> em-dash pieces ->
+            // sentences. Each sentence is its own chunk, with the
+            // pre-silence chosen by the kind of break preceding it:
+            //   paragraph break (between speaker turns) - full beat
+            //   em-dash break   (narrator aside)        - small beat
+            //   sentence break  (new sentence in turn)  - medium beat
+            //   first chunk overall                     - none
+            // Even on long compound paragraphs, sentence-grain pacing
+            // is what listeners notice; the prosody-arc lost by
+            // sub-splitting at "." is a worthwhile trade for
+            // narration to not feel rushed.
+            // Most human-typed text uses the ASCII hyphen (`-`) for
+            // a pause, sometimes doubled (`--`). The preprocessor
+            // upgrades ` - ` to ` — `, but be defensive in case the
+            // chunker is fed raw text or the preprocessor was
+            // bypassed: normalize all spaced-dash variants to em-dash
+            // here too.
+            let dashNormalized = stripped
+                .replacingOccurrences(of: " -- ", with: " — ")
+                .replacingOccurrences(of: " - ",  with: " — ")
+                .replacingOccurrences(of: " – ",  with: " — ")
+            let pieces = dashNormalized
+                .components(separatedBy: " — ")
+                .map { p in
+                    p.trimmingCharacters(in: .whitespaces)
+                }
+                .filter { p in !p.isEmpty }
+            for (pieceIdx, piece) in pieces.enumerated() {
+                let sentences = splitSentences(
+                    piece, maxLen: Int.max)
+                for (sentIdx, sentence) in sentences.enumerated() {
+                    let silence: Int
+                    if !emittedAny {
+                        silence = 0
+                    } else if pieceIdx == 0 && sentIdx == 0 {
+                        silence = paragraphSilenceMs
+                    } else if sentIdx == 0 {
+                        silence = emDashSilenceMs
+                    } else {
+                        silence = sentenceSilenceMs
+                    }
+                    let ph =
+                        (try? Phonemizer.phonemize(sentence)) ?? []
+                    // Phoneme-budget guard: if a single sentence
+                    // somehow overflows max_pos=512, emit it anyway
+                    // — the C side clamps position ids defensively
+                    // so the model degrades rather than crashes.
+                    _ = maxPhonemes
+                    out.append(PhonemizedChunk(
+                        text: sentence, phonemes: ph,
+                        priorSilenceMs: silence))
+                    emittedAny = true
+                }
             }
         }
-        return chunks
+        return out
+    }
+
+    /// Strip a leading bullet marker plus its trailing whitespace.
+    /// Only strips when the marker IS followed by whitespace, so
+    /// `*emphasis*` and `-rad` stay intact; only true list-style
+    /// bullets ("* foo", "•\tfoo", "- foo") get cleaned. Keeps the
+    /// rest of the paragraph (including embedded em-dashes etc.)
+    /// intact so the em-dash splitter can still see them.
+    private static func stripBulletMarker(_ s: String) -> String {
+        let markers: Set<Character> = ["•", "*", "-", "—", "–"]
+        guard let first = s.first, markers.contains(first),
+              s.count >= 2,
+              s[s.index(after: s.startIndex)].isWhitespace
+        else {
+            return s
+        }
+        return String(s.dropFirst())
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Split text into paragraphs. A paragraph break is either a blank
+    /// line (\n\n) OR a single newline immediately followed by a
+    /// bullet marker — common in dialogue formatting and the only way
+    /// the caller can express "new speaker turn" within a run-on
+    /// block. Recognised bullet glyphs: `•`, `*`, `-`, `—`, `–`. The
+    /// marker MUST be followed by a whitespace character (any flavor —
+    /// space, tab, NBSP, etc.) so emphasis like `*italic*` and
+    /// compound words like `well-known` are NOT treated as bullets.
+    private static func splitIntoParagraphs(_ text: String) -> [String] {
+        let withBreaks = text.replacingOccurrences(
+            of: #"\n(?=[•*\-—–]\s)"#,
+            with: "\n\n",
+            options: .regularExpression)
+        return withBreaks.components(separatedBy: "\n\n")
     }
 
     /// Split on .!? while keeping the terminal punctuation with the

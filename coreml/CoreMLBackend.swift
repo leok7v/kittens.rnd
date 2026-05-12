@@ -185,24 +185,16 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
         let effectiveSpeed = config.speed
                            * (KittenTTS.speedPriors[voiceID] ?? 1.0)
         let normalised = TextPreprocessor.process(text)
-        let chunks = TextChunker.chunk(normalised)
-        // 120 ms inter-sentence silence — only between true sentence
-        // breaks (prev chunk ends in `.!?`). Sub-clause boundaries
-        // left by the maxLen overflow split (chunks ending in `,`)
-        // get no gap, otherwise a comma-broken long sentence would
-        // hear an artificial pause inside one thought.
-        let gap = [Float](repeating: 0, count: Int(0.12 * 24000))
-        func gapAfter(_ prev: String) -> [Float] {
-            var g: [Float] = []
-            if let last = prev.last,
-               last == "." || last == "!" || last == "?" {
-                g = gap
-            }
-            return g
-        }
+        // Paragraph-aware chunking with em-dash breaks. See
+        // CPUBackend / TextChunker.phonemizedChunks for rationale.
+        let chunks = TextChunker.phonemizedChunks(normalised)
         var allAudio: [Float] = []
-        for (idx, chunk) in chunks.enumerated() {
-            let phonemes = try Phonemizer.phonemize(chunk)
+        for (_, c) in chunks.enumerated() {
+            // Stop / backend-switch cancels this Task — drop out
+            // of the loop before starting the next chunk.
+            if Task.isCancelled { break }
+            let chunk = c.text
+            let phonemes = c.phonemes
             let refId = min(chunk.count, 399)
             let style = Array(
                 voiceRows[(refId * 256)..<((refId + 1) * 256)])
@@ -210,9 +202,15 @@ public final nonisolated class KittenTTSCoreML: @unchecked Sendable {
                 phonemes: phonemes, style: style,
                 speed: effectiveSpeed,
                 variant: variant, compute: compute)
-            let emit: [Float] = idx == 0
+            if Task.isCancelled { break }
+            // Silences scale inversely with effectiveSpeed (see
+            // CPUBackend comment for rationale).
+            let silenceN = Int(
+                Double(c.priorSilenceMs) * 24.0
+                / Double(effectiveSpeed))
+            let emit: [Float] = silenceN <= 0
                 ? audio
-                : gapAfter(chunks[idx - 1]) + audio
+                : [Float](repeating: 0, count: silenceN) + audio
             if let cb = callback {
                 let int16 = emit.map { f -> Int16 in
                     // NaN/Inf can sneak through fp16 CoreML on CPU;
